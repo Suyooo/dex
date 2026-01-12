@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -159,16 +160,24 @@ func (c *DockerCollector) processContainer(cont types.Container, ch chan<- prome
 
 			c.pidsMetrics(ch, &containerStats, labelNames, labelValues)
 		}
+
+		if containerInspect, err := c.cli.ContainerInspect(context.Background(), cont.ID); err != nil {
+			log.Fatal(err)
+		} else {
+			c.uptimeMetrics(ch, &containerInspect, cName)
+
+			c.healthMetrics(ch, &containerInspect, cName)
+		}
 	}
 }
 
 func (c *DockerCollector) CPUMetrics(ch chan<- prometheus.Metric, containerStats *container.StatsResponse, labelNames []string, labelValues []string) {
 	totalUsage := containerStats.CPUStats.CPUUsage.TotalUsage
 	cpuDelta := totalUsage - containerStats.PreCPUStats.CPUUsage.TotalUsage
-	sysemDelta := containerStats.CPUStats.SystemUsage - containerStats.PreCPUStats.SystemUsage
+	systemDelta := containerStats.CPUStats.SystemUsage - containerStats.PreCPUStats.SystemUsage
 	onlineCPUs := containerStats.CPUStats.OnlineCPUs
 
-	cpuUtilization := (float64(cpuDelta) / float64(sysemDelta)) * float64(onlineCPUs) * 100.0
+	cpuUtilization := (float64(cpuDelta) / float64(systemDelta)) * float64(onlineCPUs) * 100.0
 
 	ch <- prometheus.MustNewConstMetric(prometheus.NewDesc(
 		"dex_cpu_utilization_percent",
@@ -276,4 +285,47 @@ func getCacheMemory(stats map[string]uint64) uint64 {
 	}
 	// Fallback for older versions
 	return stats["cache"]
+}
+
+func (c *DockerCollector) uptimeMetrics(ch chan<- prometheus.Metric, containerInspect *types.ContainerJSON, cName string) {
+	t, err := time.Parse(time.RFC3339Nano, containerInspect.State.StartedAt)
+	if err != nil {
+		log.Error("can't parse start date for container ", cName, ": ", err)
+		return
+	}
+
+	ch <- prometheus.MustNewConstMetric(prometheus.NewDesc(
+		"dex_container_uptime",
+		"Uptime in seconds",
+		labelCname,
+		nil,
+	), prometheus.CounterValue, float64(time.Since(t).Seconds()), cName)
+}
+
+func (c *DockerCollector) healthMetrics(ch chan<- prometheus.Metric, containerInspect *types.ContainerJSON, cName string) {
+	if containerInspect.State.Health != nil {
+		var isHealthy float64
+		if containerInspect.State.Health.Status == "healthy" {
+			isHealthy = 1
+		}
+	
+		ch <- prometheus.MustNewConstMetric(prometheus.NewDesc(
+			"dex_container_healthy",
+			"1 if docker container is healthy, 0 otherwise",
+			labelCname,
+			nil,
+		), prometheus.GaugeValue, isHealthy, cName)
+		
+		var isUnhealthy float64
+		if containerInspect.State.Health.Status == "unhealthy" {
+			isUnhealthy = 1
+		}
+		
+		ch <- prometheus.MustNewConstMetric(prometheus.NewDesc(
+			"dex_container_unhealthy",
+			"1 if docker container is unhealthy, 0 otherwise",
+			labelCname,
+			nil,
+		), prometheus.GaugeValue, isUnhealthy, cName)
+	}
 }
